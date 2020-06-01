@@ -90,7 +90,10 @@ public:
         if (!ffmpegCapture ||
            !icvRetrieveFrame_FFMPEG_p(ffmpegCapture, &data, &step, &width, &height, &cn))
             return false;
-        cv::Mat(height, width, CV_MAKETYPE(CV_8U, cn), data, step).copyTo(frame);
+
+        cv::Mat mat = cv::Mat(height, width, CV_MAKETYPE(CV_8U, cn), data, step);
+        rotateFrame(mat);
+        mat.copyTo(frame);
         return true;
     }
     virtual bool open( const cv::String& filename )
@@ -113,6 +116,25 @@ public:
 
 protected:
     CvCapture_FFMPEG* ffmpegCapture;
+private:
+    void rotateFrame(Mat &mat) const {
+        if(!ffmpegCapture) {
+            return;
+        }
+        int angle = ffmpegCapture->rotation_angle;
+        if(!ffmpegCapture->rotation_auto || (angle % 360) == 0) {
+            return;
+        }
+        if(angle == 90 || angle == -270) { // Rotate clockwise 90 degrees
+            transpose(mat, mat);
+            flip(mat, mat, 1);
+        } else if(angle == 270 || angle == -90) { // Rotate clockwise 270 degrees
+            transpose(mat, mat);
+            flip(mat, mat, 0);
+        }else if(angle == 180 || angle == -180) { // Rotate clockwise 180 degrees
+            flip(mat, mat, -1);
+        }
+    }
 };
 
 } // namespace
