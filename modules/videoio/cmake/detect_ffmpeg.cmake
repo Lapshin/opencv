@@ -16,6 +16,7 @@ if(NOT HAVE_FFMPEG AND WIN32 AND NOT ARM AND NOT OPENCV_FFMPEG_SKIP_DOWNLOAD)
     include("${FFMPEG_CMAKE_SCRIPT}")
     set(FFMPEG_libavcodec_VERSION ${FFMPEG_libavcodec_VERSION} PARENT_SCOPE) # info
     set(FFMPEG_libavformat_VERSION ${FFMPEG_libavformat_VERSION} PARENT_SCOPE) # info
+    set(FFMPEG_libavfilter_VERSION ${FFMPEG_libavfilter_VERSION} PARENT_SCOPE) # info
     set(FFMPEG_libavutil_VERSION ${FFMPEG_libavutil_VERSION} PARENT_SCOPE) # info
     set(FFMPEG_libswscale_VERSION ${FFMPEG_libswscale_VERSION} PARENT_SCOPE) # info
     set(FFMPEG_libavresample_VERSION ${FFMPEG_libavresample_VERSION} PARENT_SCOPE) # info
@@ -25,7 +26,7 @@ if(NOT HAVE_FFMPEG AND WIN32 AND NOT ARM AND NOT OPENCV_FFMPEG_SKIP_DOWNLOAD)
 endif()
 
 if(NOT HAVE_FFMPEG AND PKG_CONFIG_FOUND)
-  ocv_check_modules(FFMPEG libavcodec libavformat libavutil libswscale)
+  ocv_check_modules(FFMPEG libavcodec libavformat libavutil libavfilter libswscale)
   if(FFMPEG_FOUND)
     ocv_check_modules(FFMPEG_libavresample libavresample) # optional
     if(FFMPEG_libavresample_FOUND)

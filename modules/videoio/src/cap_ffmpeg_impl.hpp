@@ -74,6 +74,10 @@ extern "C" {
 #endif
 
 #include "ffmpeg_codecs.hpp"
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#include <libavutil/display.h>
 
 #include <libavutil/mathematics.h>
 
@@ -341,11 +345,25 @@ static int get_number_of_cpus(void)
 
 struct Image_FFMPEG
 {
+    void change_width_and_height(bool rotate);
+
     unsigned char* data;
     int step;
     int width;
     int height;
     int cn;
+    bool rotated;
+};
+
+struct Filters_FFMPEG
+{
+    int init_filters(const char *filters_descr);
+    void deinit_filters();
+
+    char args[512];
+    AVFilterContext *buffersink_ctx;
+    AVFilterContext *buffersrc_ctx;
+    AVFilterGraph   *filter_graph;
 };
 
 
@@ -475,6 +493,16 @@ static AVRational _opencv_ffmpeg_get_sample_aspect_ratio(AVStream *stream)
 #endif
 }
 
+void Image_FFMPEG::change_width_and_height(bool rotate)
+{
+    if ( rotate == rotated )
+        return;
+    int tmp = width;
+    width = height;
+    height = tmp;
+
+    rotated = !rotated;
+}
 
 struct CvCapture_FFMPEG
 {
@@ -485,6 +513,7 @@ struct CvCapture_FFMPEG
     bool setProperty(int, double);
     bool grabFrame();
     bool retrieveFrame(int, unsigned char** data, int* step, int* width, int* height, int* cn);
+    int init_img_convert_ctx();
 
     void init();
 
@@ -500,7 +529,8 @@ struct CvCapture_FFMPEG
     double  r2d(AVRational r) const;
     int64_t dts_to_frame_number(int64_t dts);
     double  dts_to_sec(int64_t dts) const;
-    int     get_rotation_angle() const;
+    void    get_rotation_angle();
+    void    apply_rotation_auto();
 
     AVFormatContext * ic;
     AVCodec         * avcodec;
@@ -516,6 +546,9 @@ struct CvCapture_FFMPEG
 
     int64_t frame_number, first_frame_number;
 
+    Filters_FFMPEG    filters;
+    bool   rotation_auto;
+    int    rotation_angle; // valid 0, 90, -90, 180, -180, 270, -270
     double eps_zero;
 /*
    'filename' contains the filename of the videosource,
@@ -563,6 +596,9 @@ void CvCapture_FFMPEG::init()
     avcodec = 0;
     frame_number = 0;
     eps_zero = 0.000025;
+
+    rotation_auto = true;
+    rotation_angle = 0;
 
 #if LIBAVFORMAT_BUILD >= CALC_FFMPEG_VERSION(52, 111, 0)
     dict = NULL;
@@ -1034,6 +1070,15 @@ bool CvCapture_FFMPEG::open( const char* _filename )
             frame.cn = 3;
             frame.step = 0;
             frame.data = NULL;
+
+            snprintf(filters.args, sizeof(filters.args),
+                     "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                     enc->width, enc->height, enc->pix_fmt,
+                     video_st->time_base.num, video_st->time_base.den,
+                     enc->sample_aspect_ratio.num, enc->sample_aspect_ratio.den);
+
+            get_rotation_angle();
+            apply_rotation_auto();
             break;
         }
     }
@@ -1244,6 +1289,17 @@ bool CvCapture_FFMPEG::grabFrame()
         // Did we get a video frame?
         if(got_picture)
         {
+            if (filters.buffersrc_ctx)
+            {
+                ret = av_buffersrc_add_frame(filters.buffersrc_ctx, picture);
+                if (ret < 0)
+                    av_log(NULL, AV_LOG_ERROR, "av_buffersrc_add_frame %d\n", ret);
+
+                ret = av_buffersink_get_frame(filters.buffersink_ctx, picture);
+                if (ret < 0)
+                    av_log(NULL, AV_LOG_ERROR, "av_buffersink_get_frame %d\n", ret);
+            }
+
             //picture_pts = picture->best_effort_timestamp;
             if( picture_pts == AV_NOPTS_VALUE_ )
                 picture_pts = picture->pkt_pts != AV_NOPTS_VALUE_ && picture->pkt_pts != 0 ? picture->pkt_pts : picture->pkt_dts;
@@ -1273,6 +1329,144 @@ bool CvCapture_FFMPEG::grabFrame()
     return valid;
 }
 
+int Filters_FFMPEG::init_filters(const char *filters_descr)
+{
+    int ret = 0;
+    av_register_all();
+    avfilter_register_all();
+    const AVFilter *buffersrc  = avfilter_get_by_name("buffer");
+    const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs  = avfilter_inout_alloc();
+
+    filter_graph = avfilter_graph_alloc();
+    if (!outputs || !inputs || !filter_graph) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if (!buffersrc || !buffersink)
+    {
+        av_log(NULL, AV_LOG_ERROR, "buffersrc %p buffersink %p\n", buffersrc, buffersink);
+        goto end;
+    }
+
+    /* buffer video source: the decoded frames from the decoder will be inserted here. */
+    ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
+                                       args, NULL, filter_graph);
+    if (ret < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source %d \n", ret);
+        goto end;
+    }
+
+    /* buffer video sink: to terminate the filter chain. */
+    ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
+                                       NULL, NULL, filter_graph);
+    if (ret < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer sink\n");
+        goto end;
+    }
+
+    /*
+     * Set the endpoints for the filter graph. The filter_graph will
+     * be linked to the graph described by filters_descr.
+     */
+
+    /*
+     * The buffer source output must be connected to the input pad of
+     * the first filter described by filters_descr; since the first
+     * filter input label is not specified, it is set to "in" by
+     * default.
+     */
+    outputs->name       = av_strdup("in");
+    outputs->filter_ctx = buffersrc_ctx;
+    outputs->pad_idx    = 0;
+    outputs->next       = NULL;
+
+    /*
+     * The buffer sink input must be connected to the output pad of
+     * the last filter described by filters_descr; since the last
+     * filter output label is not specified, it is set to "out" by
+     * default.
+     */
+    inputs->name       = av_strdup("out");
+    inputs->filter_ctx = buffersink_ctx;
+    inputs->pad_idx    = 0;
+    inputs->next       = NULL;
+
+    if ((ret = avfilter_graph_parse_ptr(filter_graph, filters_descr,
+                                        &inputs, &outputs, NULL)) < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "%s:%d", __func__, __LINE__);
+        goto end;
+    }
+
+    if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "%s:%d", __func__, __LINE__);
+        goto end;
+    }
+
+    end:
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+
+    return ret;
+}
+
+
+void Filters_FFMPEG::deinit_filters()
+{
+    avfilter_graph_free(&filter_graph);
+    buffersrc_ctx = NULL;
+    buffersink_ctx = NULL;
+}
+
+int CvCapture_FFMPEG::init_img_convert_ctx()
+{
+    // Some sws_scale optimizations have some assumptions about alignment of data/step/width/height
+    // Also we use coded_width/height to workaround problem with legacy ffmpeg versions (like n0.8)
+    int buffer_width = frame.width, buffer_height = frame.height;
+
+    img_convert_ctx = sws_getCachedContext(
+            img_convert_ctx,
+            buffer_width, buffer_height,
+            video_st->codec->pix_fmt,
+            buffer_width, buffer_height,
+            AV_PIX_FMT_BGR24,
+            SWS_BICUBIC,
+            NULL, NULL, NULL
+    );
+
+    if (img_convert_ctx == NULL)
+        return -1;//CV_Error(0, "Cannot initialize the conversion context!");
+
+#if USE_AV_FRAME_GET_BUFFER
+    av_frame_unref(&rgb_picture);
+        rgb_picture.format = AV_PIX_FMT_BGR24;
+        rgb_picture.width = buffer_width;
+        rgb_picture.height = buffer_height;
+        if (0 != av_frame_get_buffer(&rgb_picture, 32))
+        {
+            CV_WARN("OutOfMemory");
+            return -2;
+        }
+#else
+    int aligns[AV_NUM_DATA_POINTERS];
+    avcodec_align_dimensions2(video_st->codec, &buffer_width, &buffer_height, aligns);
+    rgb_picture.data[0] = (uint8_t*)realloc(rgb_picture.data[0],
+                                            _opencv_ffmpeg_av_image_get_buffer_size( AV_PIX_FMT_BGR24,
+                                                                                     buffer_width, buffer_height ));
+    _opencv_ffmpeg_av_image_fill_arrays(&rgb_picture, rgb_picture.data[0],
+                                        AV_PIX_FMT_BGR24, buffer_width, buffer_height );
+#endif
+
+    frame.data = rgb_picture.data[0];
+    frame.step = rgb_picture.linesize[0];
+    return 0;
+}
 
 bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* width, int* height, int* cn)
 {
@@ -1294,58 +1488,17 @@ bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* 
         return false;
 
     if( img_convert_ctx == NULL ||
-        frame.width != video_st->codec->width ||
-        frame.height != video_st->codec->height ||
         frame.data == NULL )
     {
-        // Some sws_scale optimizations have some assumptions about alignment of data/step/width/height
-        // Also we use coded_width/height to workaround problem with legacy ffmpeg versions (like n0.8)
-        int buffer_width = video_st->codec->coded_width, buffer_height = video_st->codec->coded_height;
-
-        img_convert_ctx = sws_getCachedContext(
-                img_convert_ctx,
-                buffer_width, buffer_height,
-                video_st->codec->pix_fmt,
-                buffer_width, buffer_height,
-                AV_PIX_FMT_BGR24,
-                SWS_BICUBIC,
-                NULL, NULL, NULL
-                );
-
-        if (img_convert_ctx == NULL)
-            return false;//CV_Error(0, "Cannot initialize the conversion context!");
-
-#if USE_AV_FRAME_GET_BUFFER
-        av_frame_unref(&rgb_picture);
-        rgb_picture.format = AV_PIX_FMT_BGR24;
-        rgb_picture.width = buffer_width;
-        rgb_picture.height = buffer_height;
-        if (0 != av_frame_get_buffer(&rgb_picture, 32))
-        {
-            CV_WARN("OutOfMemory");
+        if ( init_img_convert_ctx() != 0)
             return false;
-        }
-#else
-        int aligns[AV_NUM_DATA_POINTERS];
-        avcodec_align_dimensions2(video_st->codec, &buffer_width, &buffer_height, aligns);
-        rgb_picture.data[0] = (uint8_t*)realloc(rgb_picture.data[0],
-                _opencv_ffmpeg_av_image_get_buffer_size( AV_PIX_FMT_BGR24,
-                                    buffer_width, buffer_height ));
-        _opencv_ffmpeg_av_image_fill_arrays(&rgb_picture, rgb_picture.data[0],
-                        AV_PIX_FMT_BGR24, buffer_width, buffer_height );
-#endif
-        frame.width = video_st->codec->width;
-        frame.height = video_st->codec->height;
-        frame.cn = 3;
-        frame.data = rgb_picture.data[0];
-        frame.step = rgb_picture.linesize[0];
     }
 
     sws_scale(
             img_convert_ctx,
             picture->data,
             picture->linesize,
-            0, video_st->codec->coded_height,
+            0, frame.height,
             rgb_picture.data,
             rgb_picture.linesize
             );
@@ -1429,7 +1582,9 @@ double CvCapture_FFMPEG::getProperty( int property_id ) const
     case CAP_PROP_BITRATE:
         return static_cast<double>(get_bitrate());
     case CAP_PROP_ORIENTATION_META:
-        return static_cast<double>(get_rotation_angle());
+        return static_cast<double>(rotation_angle);
+    case CAP_PROP_ORIENTATION_AUTO:
+        return static_cast<double>(rotation_auto);
     default:
         break;
     }
@@ -1508,14 +1663,12 @@ double CvCapture_FFMPEG::dts_to_sec(int64_t dts) const
         r2d(ic->streams[video_stream]->time_base);
 }
 
-int CvCapture_FFMPEG::get_rotation_angle() const
+void CvCapture_FFMPEG::get_rotation_angle()
 {
-    int angle = 0;
+    rotation_angle = 0;
     AVDictionaryEntry *rotate_tag = av_dict_get(video_st->metadata, "rotate", NULL, 0);
     if (rotate_tag != NULL)
-        angle = atoi(rotate_tag->value);
-
-    return angle;
+        rotation_angle = atoi(rotate_tag->value);
 }
 
 void CvCapture_FFMPEG::seek(int64_t _frame_number)
@@ -1613,6 +1766,13 @@ bool CvCapture_FFMPEG::setProperty( int property_id, double value )
         if (value == -1)
             return setRaw();
         return false;
+    case CAP_PROP_ORIENTATION_AUTO:
+        if (rotation_auto != bool(value))
+        {
+            rotation_auto = bool(value);
+            apply_rotation_auto();
+        }
+        break;
     default:
         return false;
     }
@@ -2197,6 +2357,30 @@ void CvVideoWriter_FFMPEG::close()
     init();
 }
 
+void CvCapture_FFMPEG::apply_rotation_auto()
+{
+    if (rotation_auto && (rotation_angle%360 != 0))
+    {
+        if (rotation_angle == 90 || rotation_angle == -270 ||
+            rotation_angle == 270 || rotation_angle == -90)
+        {
+            if (rotation_angle == 90 || rotation_angle == -270)
+                filters.init_filters("transpose=clock");
+            else
+                filters.init_filters("transpose=cclock");
+            frame.change_width_and_height(true);
+        } else {
+            // TODO flip video up-down
+        }
+    }
+    else
+    {
+        filters.deinit_filters();
+        frame.change_width_and_height(false);
+    }
+    init_img_convert_ctx();
+}
+
 #define CV_PRINTABLE_CHAR(ch) ((ch) < 32 ? '?' : (ch))
 #define CV_TAG_TO_PRINTABLE_CHAR4(tag) CV_PRINTABLE_CHAR((tag) & 255), CV_PRINTABLE_CHAR(((tag) >> 8) & 255), CV_PRINTABLE_CHAR(((tag) >> 16) & 255), CV_PRINTABLE_CHAR(((tag) >> 24) & 255)
 
@@ -2534,7 +2718,6 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
     }
 
     outbuf = NULL;
-
 
 #if LIBAVFORMAT_BUILD < CALC_FFMPEG_VERSION(57, 0, 0)
     if (!(oc->oformat->flags & AVFMT_RAWPICTURE))
